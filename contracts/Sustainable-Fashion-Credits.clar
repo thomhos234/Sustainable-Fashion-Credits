@@ -8,6 +8,21 @@
 (define-constant err-already-registered (err u106))
 (define-constant err-invalid-material-type (err u107))
 (define-constant err-credit-already-redeemed (err u108))
+(define-constant err-milestone-already-claimed (err u109))
+(define-constant err-invalid-carbon-calculation (err u110))
+
+(define-constant carbon-rate-recycled u50)
+(define-constant carbon-rate-organic u30)
+(define-constant carbon-rate-fair-trade u20)
+(define-constant carbon-rate-sustainable u40)
+(define-constant carbon-milestone-bronze u1000)
+(define-constant carbon-milestone-silver u5000)
+(define-constant carbon-milestone-gold u10000)
+(define-constant carbon-milestone-platinum u25000)
+(define-constant milestone-reward-bronze u100)
+(define-constant milestone-reward-silver u500)
+(define-constant milestone-reward-gold u1000)
+(define-constant milestone-reward-platinum u5000)
 
 (define-data-var next-brand-id uint u1)
 (define-data-var next-credit-id uint u1)
@@ -54,6 +69,40 @@
     verification-height: uint
   }
 )
+
+(define-map carbon-offsets
+  { brand-id: uint }
+  {
+    total-carbon-offset: uint,
+    recycled-offset: uint,
+    organic-offset: uint,
+    fair-trade-offset: uint,
+    sustainable-offset: uint,
+    last-updated: uint
+  }
+)
+
+(define-map milestone-achievements
+  { brand-id: uint, milestone: (string-ascii 20) }
+  {
+    achieved: bool,
+    achieved-height: uint,
+    reward-claimed: bool
+  }
+)
+
+(define-map environmental-impact
+  { brand-id: uint }
+  {
+    trees-equivalent: uint,
+    water-saved-liters: uint,
+    energy-saved-kwh: uint,
+    impact-score: uint
+  }
+)
+
+(define-data-var total-platform-carbon-offset uint u0)
+(define-data-var total-milestone-rewards-distributed uint u0)
 
 (define-read-only (get-contract-owner)
   contract-owner
@@ -189,7 +238,141 @@
     )
     
     (var-set next-credit-id (+ credit-id u1))
+    
+    (unwrap-panic (update-carbon-offset brand-id material-type amount))
+    
     (ok credit-id)
+  )
+)
+
+(define-private (get-carbon-rate (material-type (string-ascii 20)))
+  (if (is-eq material-type "recycled")
+    carbon-rate-recycled
+    (if (is-eq material-type "organic")
+      carbon-rate-organic
+      (if (is-eq material-type "fair-trade")
+        carbon-rate-fair-trade
+        (if (is-eq material-type "sustainable")
+          carbon-rate-sustainable
+          u0)))))
+
+(define-private (calculate-carbon-offset (material-type (string-ascii 20)) (amount uint))
+  (let ((rate (get-carbon-rate material-type)))
+    (/ (* amount rate) u100)))
+
+(define-private (update-carbon-offset (brand-id uint) (material-type (string-ascii 20)) (amount uint))
+  (let 
+    (
+      (carbon-saved (calculate-carbon-offset material-type amount))
+      (current-offsets (default-to
+        {
+          total-carbon-offset: u0,
+          recycled-offset: u0,
+          organic-offset: u0,
+          fair-trade-offset: u0,
+          sustainable-offset: u0,
+          last-updated: stacks-block-height
+        }
+        (map-get? carbon-offsets { brand-id: brand-id })))
+      (new-total (+ (get total-carbon-offset current-offsets) carbon-saved))
+    )
+    (map-set carbon-offsets
+      { brand-id: brand-id }
+      (merge current-offsets
+        {
+          total-carbon-offset: new-total,
+          recycled-offset: (if (is-eq material-type "recycled")
+                              (+ (get recycled-offset current-offsets) carbon-saved)
+                              (get recycled-offset current-offsets)),
+          organic-offset: (if (is-eq material-type "organic")
+                            (+ (get organic-offset current-offsets) carbon-saved)
+                            (get organic-offset current-offsets)),
+          fair-trade-offset: (if (is-eq material-type "fair-trade")
+                               (+ (get fair-trade-offset current-offsets) carbon-saved)
+                               (get fair-trade-offset current-offsets)),
+          sustainable-offset: (if (is-eq material-type "sustainable")
+                                (+ (get sustainable-offset current-offsets) carbon-saved)
+                                (get sustainable-offset current-offsets)),
+          last-updated: stacks-block-height
+        }
+      )
+    )
+    
+    (var-set total-platform-carbon-offset (+ (var-get total-platform-carbon-offset) carbon-saved))
+    
+    (unwrap-panic (update-environmental-impact brand-id carbon-saved))
+    (unwrap-panic (check-and-award-milestones brand-id new-total))
+    
+    (ok true)
+  )
+)
+
+(define-private (update-environmental-impact (brand-id uint) (carbon-saved uint))
+  (let
+    (
+      (current-impact (default-to
+        {
+          trees-equivalent: u0,
+          water-saved-liters: u0,
+          energy-saved-kwh: u0,
+          impact-score: u0
+        }
+        (map-get? environmental-impact { brand-id: brand-id })))
+      (trees (/ carbon-saved u20))
+      (water (/ (* carbon-saved u2500) u100))
+      (energy (/ (* carbon-saved u150) u100))
+    )
+    (map-set environmental-impact
+      { brand-id: brand-id }
+      {
+        trees-equivalent: (+ (get trees-equivalent current-impact) trees),
+        water-saved-liters: (+ (get water-saved-liters current-impact) water),
+        energy-saved-kwh: (+ (get energy-saved-kwh current-impact) energy),
+        impact-score: (+ (get impact-score current-impact) (/ carbon-saved u10))
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-private (check-and-award-milestones (brand-id uint) (total-offset uint))
+  (begin
+    (if (and (>= total-offset carbon-milestone-bronze)
+             (not (get achieved (default-to { achieved: false, achieved-height: u0, reward-claimed: false }
+                                            (map-get? milestone-achievements { brand-id: brand-id, milestone: "bronze" })))))
+      (begin (unwrap-panic (award-milestone brand-id "bronze" milestone-reward-bronze)) true)
+      true)
+    (if (and (>= total-offset carbon-milestone-silver)
+             (not (get achieved (default-to { achieved: false, achieved-height: u0, reward-claimed: false }
+                                            (map-get? milestone-achievements { brand-id: brand-id, milestone: "silver" })))))
+      (begin (unwrap-panic (award-milestone brand-id "silver" milestone-reward-silver)) true)
+      true)
+    (if (and (>= total-offset carbon-milestone-gold)
+             (not (get achieved (default-to { achieved: false, achieved-height: u0, reward-claimed: false }
+                                            (map-get? milestone-achievements { brand-id: brand-id, milestone: "gold" })))))
+      (begin (unwrap-panic (award-milestone brand-id "gold" milestone-reward-gold)) true)
+      true)
+    (if (and (>= total-offset carbon-milestone-platinum)
+             (not (get achieved (default-to { achieved: false, achieved-height: u0, reward-claimed: false }
+                                            (map-get? milestone-achievements { brand-id: brand-id, milestone: "platinum" })))))
+      (begin (unwrap-panic (award-milestone brand-id "platinum" milestone-reward-platinum)) true)
+      true)
+    (ok true)
+  )
+)
+
+(define-private (award-milestone (brand-id uint) (milestone (string-ascii 20)) (reward uint))
+  (begin
+    (map-set milestone-achievements
+      { brand-id: brand-id, milestone: milestone }
+      {
+        achieved: true,
+        achieved-height: stacks-block-height,
+        reward-claimed: false
+      }
+    )
+    (var-set total-milestone-rewards-distributed (+ (var-get total-milestone-rewards-distributed) reward))
+    (ok true)
   )
 )
 
@@ -275,5 +458,94 @@
       (ok verification-result)
     )
     error (err error)
+  )
+)
+
+(define-read-only (get-brand-carbon-offset (brand-id uint))
+  (map-get? carbon-offsets { brand-id: brand-id })
+)
+
+(define-read-only (get-brand-environmental-impact (brand-id uint))
+  (map-get? environmental-impact { brand-id: brand-id })
+)
+
+(define-read-only (get-milestone-achievement (brand-id uint) (milestone (string-ascii 20)))
+  (map-get? milestone-achievements { brand-id: brand-id, milestone: milestone })
+)
+
+(define-read-only (get-total-platform-carbon-offset)
+  (ok (var-get total-platform-carbon-offset))
+)
+
+(define-read-only (get-total-milestone-rewards)
+  (ok (var-get total-milestone-rewards-distributed))
+)
+
+(define-read-only (calculate-expected-carbon-offset (material-type (string-ascii 20)) (amount uint))
+  (ok (calculate-carbon-offset material-type amount))
+)
+
+(define-read-only (get-brand-sustainability-score (brand-id uint))
+  (match (map-get? carbon-offsets { brand-id: brand-id })
+    offsets
+    (let 
+      (
+        (total-offset (get total-carbon-offset offsets))
+        (bronze-achieved (get achieved (default-to { achieved: false, achieved-height: u0, reward-claimed: false }
+                                                   (map-get? milestone-achievements { brand-id: brand-id, milestone: "bronze" }))))
+        (silver-achieved (get achieved (default-to { achieved: false, achieved-height: u0, reward-claimed: false }
+                                                   (map-get? milestone-achievements { brand-id: brand-id, milestone: "silver" }))))
+        (gold-achieved (get achieved (default-to { achieved: false, achieved-height: u0, reward-claimed: false }
+                                                 (map-get? milestone-achievements { brand-id: brand-id, milestone: "gold" }))))
+        (platinum-achieved (get achieved (default-to { achieved: false, achieved-height: u0, reward-claimed: false }
+                                                     (map-get? milestone-achievements { brand-id: brand-id, milestone: "platinum" }))))
+        (milestone-points (+ (if bronze-achieved u10 u0)
+                            (+ (if silver-achieved u25 u0)
+                               (+ (if gold-achieved u50 u0)
+                                  (if platinum-achieved u100 u0)))))
+      )
+      (ok {
+        total-carbon-offset: total-offset,
+        sustainability-score: (+ (/ total-offset u100) milestone-points),
+        milestone-level: (if platinum-achieved "platinum"
+                           (if gold-achieved "gold"
+                             (if silver-achieved "silver"
+                               (if bronze-achieved "bronze" "none"))))
+      })
+    )
+    (ok { total-carbon-offset: u0, sustainability-score: u0, milestone-level: "none" })
+  )
+)
+
+(define-public (claim-milestone-reward (brand-id uint) (milestone (string-ascii 20)))
+  (let 
+    (
+      (brand-data (unwrap! (get-brand-info brand-id) err-brand-not-found))
+      (achievement (unwrap! (get-milestone-achievement brand-id milestone) err-milestone-already-claimed))
+    )
+    (asserts! (is-eq (get owner brand-data) tx-sender) err-not-authorized)
+    (asserts! (get achieved achievement) err-milestone-already-claimed)
+    (asserts! (not (get reward-claimed achievement)) err-milestone-already-claimed)
+    
+    (map-set milestone-achievements
+      { brand-id: brand-id, milestone: milestone }
+      (merge achievement { reward-claimed: true })
+    )
+    
+    (let ((reward (if (is-eq milestone "bronze") milestone-reward-bronze
+                    (if (is-eq milestone "silver") milestone-reward-silver
+                      (if (is-eq milestone "gold") milestone-reward-gold
+                        (if (is-eq milestone "platinum") milestone-reward-platinum u0))))))
+      (if (> reward u0)
+        (let ((current-balance (get balance (get-credit-balance tx-sender brand-id "sustainable"))))
+          (map-set credit-balances
+            { owner: tx-sender, brand-id: brand-id, material-type: "sustainable" }
+            { balance: (+ current-balance reward) }
+          )
+          (ok reward)
+        )
+        (ok u0)
+      )
+    )
   )
 )
