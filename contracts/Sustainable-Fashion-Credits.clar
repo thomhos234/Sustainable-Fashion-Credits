@@ -10,6 +10,10 @@
 (define-constant err-credit-already-redeemed (err u108))
 (define-constant err-milestone-already-claimed (err u109))
 (define-constant err-invalid-carbon-calculation (err u110))
+(define-constant err-verifier-not-authorized (err u111))
+(define-constant err-checkpoint-not-found (err u112))
+(define-constant err-invalid-checkpoint-type (err u113))
+(define-constant err-product-not-found (err u114))
 
 (define-constant carbon-rate-recycled u50)
 (define-constant carbon-rate-organic u30)
@@ -101,8 +105,46 @@
   }
 )
 
+(define-map authorized-verifiers
+  { verifier: principal }
+  {
+    role: (string-ascii 30),
+    organization: (string-ascii 50),
+    authorized: bool,
+    authorization-height: uint,
+    verification-count: uint
+  }
+)
+
+(define-map supply-chain-checkpoints
+  { checkpoint-id: uint }
+  {
+    credit-id: uint,
+    product-hash: (string-ascii 64),
+    checkpoint-type: (string-ascii 30),
+    verifier: principal,
+    location: (string-ascii 50),
+    standards-met: (string-ascii 100),
+    verification-height: uint,
+    verified: bool,
+    previous-checkpoint-id: (optional uint)
+  }
+)
+
+(define-map product-checkpoint-chain
+  { credit-id: uint }
+  {
+    checkpoint-count: uint,
+    first-checkpoint-id: (optional uint),
+    latest-checkpoint-id: (optional uint),
+    verification-score: uint
+  }
+)
+
 (define-data-var total-platform-carbon-offset uint u0)
 (define-data-var total-milestone-rewards-distributed uint u0)
+(define-data-var next-checkpoint-id uint u1)
+(define-data-var total-verified-checkpoints uint u0)
 
 (define-read-only (get-contract-owner)
   contract-owner
@@ -547,5 +589,212 @@
         (ok u0)
       )
     )
+  )
+)
+
+(define-read-only (is-valid-checkpoint-type (checkpoint-type (string-ascii 30)))
+  (or
+    (is-eq checkpoint-type "raw-material")
+    (or
+      (is-eq checkpoint-type "manufacturing")
+      (or
+        (is-eq checkpoint-type "quality-control")
+        (or
+          (is-eq checkpoint-type "packaging")
+          (or
+            (is-eq checkpoint-type "distribution")
+            (is-eq checkpoint-type "certification")
+          )
+        )
+      )
+    )
+  )
+)
+
+(define-public (authorize-verifier (verifier principal) (role (string-ascii 30)) (organization (string-ascii 50)))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set authorized-verifiers
+      { verifier: verifier }
+      {
+        role: role,
+        organization: organization,
+        authorized: true,
+        authorization-height: stacks-block-height,
+        verification-count: u0
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (revoke-verifier (verifier principal))
+  (let ((verifier-data (unwrap! (map-get? authorized-verifiers { verifier: verifier }) err-verifier-not-authorized)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set authorized-verifiers
+      { verifier: verifier }
+      (merge verifier-data { authorized: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (record-supply-chain-checkpoint
+    (credit-id uint)
+    (checkpoint-type (string-ascii 30))
+    (location (string-ascii 50))
+    (standards-met (string-ascii 100))
+  )
+  (let
+    (
+      (credit-data (unwrap! (get-credit-info credit-id) err-credit-not-found))
+      (verifier-data (unwrap! (map-get? authorized-verifiers { verifier: tx-sender }) err-verifier-not-authorized))
+      (checkpoint-id (var-get next-checkpoint-id))
+      (product-hash (get product-hash credit-data))
+      (chain-data (default-to
+        {
+          checkpoint-count: u0,
+          first-checkpoint-id: none,
+          latest-checkpoint-id: none,
+          verification-score: u0
+        }
+        (map-get? product-checkpoint-chain { credit-id: credit-id })))
+    )
+    (asserts! (get authorized verifier-data) err-verifier-not-authorized)
+    (asserts! (is-valid-checkpoint-type checkpoint-type) err-invalid-checkpoint-type)
+    
+    (map-set supply-chain-checkpoints
+      { checkpoint-id: checkpoint-id }
+      {
+        credit-id: credit-id,
+        product-hash: product-hash,
+        checkpoint-type: checkpoint-type,
+        verifier: tx-sender,
+        location: location,
+        standards-met: standards-met,
+        verification-height: stacks-block-height,
+        verified: true,
+        previous-checkpoint-id: (get latest-checkpoint-id chain-data)
+      }
+    )
+    
+    (let
+      (
+        (new-count (+ (get checkpoint-count chain-data) u1))
+        (new-score (+ (get verification-score chain-data) u10))
+      )
+      (map-set product-checkpoint-chain
+        { credit-id: credit-id }
+        {
+          checkpoint-count: new-count,
+          first-checkpoint-id: (if (is-none (get first-checkpoint-id chain-data))
+                                  (some checkpoint-id)
+                                  (get first-checkpoint-id chain-data)),
+          latest-checkpoint-id: (some checkpoint-id),
+          verification-score: new-score
+        }
+      )
+    )
+    
+    (map-set authorized-verifiers
+      { verifier: tx-sender }
+      (merge verifier-data { verification-count: (+ (get verification-count verifier-data) u1) })
+    )
+    
+    (var-set next-checkpoint-id (+ checkpoint-id u1))
+    (var-set total-verified-checkpoints (+ (var-get total-verified-checkpoints) u1))
+    
+    (ok checkpoint-id)
+  )
+)
+
+(define-read-only (get-verifier-info (verifier principal))
+  (map-get? authorized-verifiers { verifier: verifier })
+)
+
+(define-read-only (get-checkpoint-info (checkpoint-id uint))
+  (map-get? supply-chain-checkpoints { checkpoint-id: checkpoint-id })
+)
+
+(define-read-only (get-product-checkpoint-chain (credit-id uint))
+  (map-get? product-checkpoint-chain { credit-id: credit-id })
+)
+
+(define-read-only (get-supply-chain-transparency-score (credit-id uint))
+  (match (map-get? product-checkpoint-chain { credit-id: credit-id })
+    chain-data
+    (let
+      (
+        (checkpoint-count (get checkpoint-count chain-data))
+        (verification-score (get verification-score chain-data))
+        (transparency-level
+          (if (>= checkpoint-count u5)
+            "excellent"
+            (if (>= checkpoint-count u3)
+              "good"
+              (if (>= checkpoint-count u1)
+                "basic"
+                "unverified"))))
+      )
+      (ok {
+        checkpoint-count: checkpoint-count,
+        verification-score: verification-score,
+        transparency-level: transparency-level,
+        first-checkpoint: (get first-checkpoint-id chain-data),
+        latest-checkpoint: (get latest-checkpoint-id chain-data)
+      })
+    )
+    (ok {
+      checkpoint-count: u0,
+      verification-score: u0,
+      transparency-level: "unverified",
+      first-checkpoint: none,
+      latest-checkpoint: none
+    })
+  )
+)
+
+(define-read-only (trace-supply-chain (checkpoint-id uint))
+  (match (get-checkpoint-info checkpoint-id)
+    checkpoint
+    (ok {
+      checkpoint-id: checkpoint-id,
+      credit-id: (get credit-id checkpoint),
+      checkpoint-type: (get checkpoint-type checkpoint),
+      verifier: (get verifier checkpoint),
+      location: (get location checkpoint),
+      standards-met: (get standards-met checkpoint),
+      verification-height: (get verification-height checkpoint),
+      previous-checkpoint: (get previous-checkpoint-id checkpoint)
+    })
+    err-checkpoint-not-found
+  )
+)
+
+(define-read-only (get-total-verified-checkpoints)
+  (ok (var-get total-verified-checkpoints))
+)
+
+(define-read-only (get-enhanced-sustainability-score (credit-id uint) (brand-id uint))
+  (let
+    (
+      (chain-data (default-to
+        {
+          checkpoint-count: u0,
+          first-checkpoint-id: none,
+          latest-checkpoint-id: none,
+          verification-score: u0
+        }
+        (map-get? product-checkpoint-chain { credit-id: credit-id })))
+      (base-score (unwrap! (get-brand-sustainability-score brand-id) err-brand-not-found))
+    )
+    (ok {
+      base-sustainability-score: (get sustainability-score base-score),
+      supply-chain-verification-score: (get verification-score chain-data),
+      total-enhanced-score: (+ (get sustainability-score base-score) (get verification-score chain-data)),
+      checkpoint-count: (get checkpoint-count chain-data),
+      carbon-offset: (get total-carbon-offset base-score),
+      milestone-level: (get milestone-level base-score)
+    })
   )
 )
